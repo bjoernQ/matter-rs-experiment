@@ -3,11 +3,11 @@ use domain::base::header::Flags;
 use domain::base::iana::Class;
 use domain::base::octets::{Octets256, Octets64, OctetsBuilder};
 use domain::base::{Dname, MessageBuilder, Record};
-use domain::rdata::{Ptr, Srv, Txt, A};
+use domain::rdata::{Aaaa, Ptr, Srv, Txt};
 use esp_println::println;
 use esp_wifi::wifi_interface::UdpSocket;
 use matter::mdns::Mdns;
-use smoltcp::wire::Ipv4Address;
+use smoltcp::wire::{IpAddress, Ipv4Address};
 
 use core::str::FromStr;
 
@@ -19,7 +19,7 @@ pub struct DnsSdResponder<'a, 'b> {
 impl<'a, 'b> DnsSdResponder<'a, 'b> {
     pub fn new(mut socket: UdpSocket<'a, 'b>, _local_ip: [u8; 4]) -> Self {
         socket
-            .join_multicast_group(Ipv4Address::new(224, 0, 0, 251))
+            .join_multicast_group(IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 251)))
             .unwrap();
         socket.bind(5353).unwrap();
 
@@ -53,7 +53,7 @@ impl<'a, 'b> DnsSdResponder<'a, 'b> {
 
                     self.socket
                         .send(
-                            Ipv4Address::new(224, 0, 0, 251),
+                            IpAddress::Ipv4(Ipv4Address::new(224, 0, 0, 251)),
                             5353,
                             &RECORD[..RECORD_LEN],
                         )
@@ -96,7 +96,7 @@ static mut RECORD: [u8; 1000] = [0u8; 1000];
 static mut RECORD_LEN: usize = 0;
 
 pub struct FakeDnsResponder {
-    pub local_ip: [u8; 4],
+    pub local_ip: [u16; 8],
 }
 
 impl Mdns for FakeDnsResponder {
@@ -152,7 +152,7 @@ fn create_record(
     buffer: &mut [u8],
     id: u16,
     hostname: &str,
-    ip: &[u8; 4],
+    ip: &[u16; 8],
 
     name: &str,
     service: &str,
@@ -248,11 +248,11 @@ fn create_record(
         Record::new(Dname::from_str(&dname).unwrap(), Class::In, TTL, txt);
     message.push(record).unwrap();
 
-    let record: Record<Dname<Octets64>, A> = Record::new(
+    let record: Record<Dname<Octets64>, Aaaa> = Record::new(
         Dname::from_str(&hname).unwrap(),
         Class::In,
         TTL,
-        A::from_octets(ip[0], ip[1], ip[2], ip[3]),
+        Aaaa::new((*ip).into()),
     );
     message.push(record).unwrap();
 

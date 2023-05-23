@@ -30,7 +30,7 @@ use matter::transport::network::Address;
 // use matter::transport::packet::{MAX_RX_BUF_SIZE, MAX_TX_BUF_SIZE};
 use matter::{CommissioningData, Matter};
 use smoltcp::iface::SocketStorage;
-use smoltcp::wire::Ipv4Address;
+use smoltcp::wire::{IpAddress, Ipv6Address};
 
 mod dev_attr;
 use dev_attr::HardCodedDevAtt;
@@ -137,6 +137,8 @@ fn main() -> ! {
     println!("{:?}", controller.is_connected());
 
     let mut local_ip = [0u8; 4];
+    let mut local_ipv6 = [0u16; 8];
+
     // wait for getting an ip address
     println!("Wait to get an ip address");
     loop {
@@ -145,9 +147,25 @@ fn main() -> ! {
         if wifi_stack.is_iface_up() {
             println!("got ip {:?}", wifi_stack.get_ip_info());
             local_ip.copy_from_slice(&wifi_stack.get_ip_info().unwrap().ip.octets());
+            wifi_stack.get_ip_addresses(|addrs| {
+                for addr in addrs {
+                    match addr {
+                        smoltcp::wire::IpCidr::Ipv4(_) => (),
+                        smoltcp::wire::IpCidr::Ipv6(v6) => {
+                            v6.address().write_parts(&mut local_ipv6);
+                            // local_ipv6.copy_from_slice(&[
+                            //     0xfe80, 0, 0, 0, 0x36b4, 0x72ff, 0xfe4c, 0x4410,
+                            // ]);
+                        }
+                    }
+                }
+            });
             break;
         }
     }
+
+    println!("IPv4 {:?}", &local_ip);
+    println!("IPv6 {:x?}", &local_ipv6);
 
     // these buffers were 1536
     let mut rx_meta1 = [smoltcp::socket::udp::PacketMetadata::EMPTY; 4];
@@ -188,7 +206,9 @@ fn main() -> ! {
     };
 
     let mut mdns = DnsSdResponder::new(mdns_socket, local_ip);
-    let mut dummy_dns = FakeDnsResponder { local_ip };
+    let mut dummy_dns = FakeDnsResponder {
+        local_ip: local_ipv6,
+    };
 
     let matter = Matter::new(
         &dev_info,
@@ -227,30 +247,47 @@ fn main() -> ! {
         let (len, from, from_port) = if let Ok(res) = matter_socket.receive(&mut rx_buf) {
             res
         } else {
-            (0usize, [0u8, 0u8, 0u8, 0u8], 0)
+            (0usize, IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0)
         };
 
         if len == 0 {
             continue;
         }
 
-        let addr = no_std_net::SocketAddr::V4(no_std_net::SocketAddrV4::new(
-            no_std_net::Ipv4Addr::new(from[0], from[1], from[2], from[3]),
+        let mut from_parts = [0u16; 8];
+        match from {
+            IpAddress::Ipv4(_) => panic!("IPv4 NOT supported"),
+            IpAddress::Ipv6(v6) => v6.write_parts(&mut from_parts),
+        }
+
+        let addr = no_std_net::SocketAddr::V6(no_std_net::SocketAddrV6::new(
+            no_std_net::Ipv6Addr::new(
+                from_parts[0],
+                from_parts[1],
+                from_parts[2],
+                from_parts[3],
+                from_parts[4],
+                from_parts[5],
+                from_parts[6],
+                from_parts[7],
+            ), //from,
             from_port,
+            0, // flowinfo?
+            0, // scope id?
         ));
         let addr = matter::transport::network::Address::Udp(addr);
-        println!("RECEIVED {} bytes", len);
+        println!("RECEIVED {} bytes from {:?}", len, addr);
         let mut completion = transport.recv(addr, &mut rx_buf[..len], &mut tx_buf);
 
         while let Some(action) = completion.next_action().unwrap() {
             match action {
                 RecvAction::Send(addr, buf) => {
-                    if let Address::Udp(no_std_net::SocketAddr::V4(addr)) = addr {
+                    if let Address::Udp(no_std_net::SocketAddr::V6(addr)) = addr {
                         let port = addr.port();
                         let addr = addr.ip().octets();
                         println!("SENDING {} bytes to {:?}:{}", buf.len(), addr, port);
                         matter_socket
-                            .send(Ipv4Address::from_bytes(&addr), port, buf)
+                            .send(IpAddress::Ipv6(Ipv6Address::from_bytes(&addr)), port, buf)
                             .unwrap();
                     }
                 }
@@ -275,12 +312,16 @@ fn main() -> ! {
                     if im.handle(&mut ctx).unwrap() {
                         if ctx.send().unwrap() {
                             let addr = ctx.tx.peer;
-                            if let Address::Udp(no_std_net::SocketAddr::V4(addr)) = addr {
+                            if let Address::Udp(no_std_net::SocketAddr::V6(addr)) = addr {
                                 let port = addr.port();
                                 let addr = addr.ip().octets();
-                                println!("SENDING {} bytes", ctx.tx.as_slice().len());
+                                println!("SENDING {} bytes to {:?}:{}", buf.len(), addr, port);
                                 matter_socket
-                                    .send(Ipv4Address::from_bytes(&addr), port, ctx.tx.as_slice())
+                                    .send(
+                                        IpAddress::Ipv6(Ipv6Address::from_bytes(&addr)),
+                                        port,
+                                        ctx.tx.as_slice(),
+                                    )
                                     .unwrap();
                             }
                         }
