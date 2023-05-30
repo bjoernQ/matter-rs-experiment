@@ -1,44 +1,49 @@
 #![no_std]
 #![no_main]
+#![feature(type_alias_impl_trait)]
+#![feature(async_fn_in_trait)]
 
-use core::borrow::Borrow;
+use core::cell::RefCell;
+use core::pin::pin;
 
-use embedded_svc::ipv4::Interface;
+use embassy_executor::Executor;
+use embassy_executor::_export::StaticCell;
+use hal::gpio::{Gpio5, Output, PushPull};
+
+use core::borrow::{Borrow, BorrowMut};
+use embassy_futures::select::select4;
+use embassy_net::udp::UdpSocket;
+use embassy_net::{udp::PacketMetadata, Config, Ipv4Address, Stack, StackResources};
+use embassy_time::{Duration, Timer};
 use embedded_svc::wifi::Wifi;
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use esp_backtrace as _;
 use esp_println::println;
-use esp_wifi::wifi::utils::create_network_interface;
-use esp_wifi::wifi::WifiMode;
-use esp_wifi::wifi_interface::WifiStack;
+use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiMode, WifiState};
 use esp_wifi::{current_millis, initialize};
 use hal::clock::{ClockControl, CpuClock};
 use hal::systimer::SystemTimer;
-use hal::Rng;
+use hal::{embassy, Rng, IO};
 use hal::{peripherals::Peripherals, prelude::*, timer::TimerGroup, Rtc};
+use log::info;
 use matter::data_model::cluster_basic_information::BasicInfoConfig;
-use matter::data_model::core::DataModel;
 use matter::data_model::device_types::DEV_TYPE_ON_OFF_LIGHT;
 use matter::data_model::objects::{Endpoint, Handler, Node};
-use matter::data_model::sdm::dev_att::DevAttDataFetcher;
 use matter::data_model::system_model::descriptor;
 use matter::data_model::{cluster_on_off, root_endpoint};
-use matter::interaction_model::core::InteractionModel;
 use matter::secure_channel::spake2p::VerifierData;
-use matter::transport::mgr::{RecvAction, TransportMgr};
+use matter::transport::exchange::MAX_EXCHANGES;
 use matter::transport::network::Address;
-// use matter::transport::packet::{MAX_RX_BUF_SIZE, MAX_TX_BUF_SIZE};
+use matter::transport::pipe::{Chunk, Pipe};
+use matter::transport::transport::{PacketPools, Transport};
+use matter::utils::select::EitherUnwrap;
 use matter::{CommissioningData, Matter};
-use smoltcp::iface::SocketStorage;
-use smoltcp::wire::{IpAddress, Ipv6Address};
+use no_std_net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use smoltcp::wire::{IpAddress, IpEndpoint, Ipv6Address};
 
 mod dev_attr;
-use dev_attr::HardCodedDevAtt;
 
 mod dnssd;
-use dnssd::DnsSdResponder;
-
-use crate::dnssd::FakeDnsResponder;
 
 extern crate alloc;
 
@@ -47,6 +52,20 @@ static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+
+static LED: critical_section::Mutex<RefCell<Option<Gpio5<Output<PushPull>>>>> =
+    critical_section::Mutex::new(RefCell::new(None));
+
+macro_rules! singleton {
+    ($val:expr) => {{
+        type T = impl Sized;
+        static STATIC_CELL: StaticCell<T> = StaticCell::new();
+        let (x,) = STATIC_CELL.init(($val,));
+        x
+    }};
+}
+
+static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 fn init_heap() {
     const HEAP_SIZE: usize = 2 * 1024;
@@ -89,6 +108,12 @@ fn main() -> ! {
     wdt0.disable();
     wdt1.disable();
 
+    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
+    let led = io.pins.gpio5.into_push_pull_output();
+    critical_section::with(|cs| {
+        LED.borrow_ref_mut(cs).replace(led);
+    });
+
     let systimer = SystemTimer::new(peripherals.SYSTIMER);
     initialize(
         systimer.alarm0,
@@ -100,245 +125,376 @@ fn main() -> ! {
 
     // Connect to wifi
     let (wifi, _) = peripherals.RADIO.split();
-    let mut socket_set_entries: [SocketStorage; 3] = Default::default();
-    let (iface, device, mut controller, sockets) =
-        create_network_interface(wifi, WifiMode::Sta, &mut socket_set_entries);
-    let wifi_stack = WifiStack::new(iface, device, sockets, current_millis);
+    let (wifi_interface, controller) = esp_wifi::wifi::new_with_mode(wifi, WifiMode::Sta);
 
-    let client_config = Configuration::Client(ClientConfiguration {
-        ssid: SSID.into(),
-        password: PASSWORD.into(),
-        ..Default::default()
-    });
-    let res = controller.set_configuration(&client_config);
-    println!("wifi_set_configuration returned {:?}", res);
+    embassy::init(&clocks, timer_group0.timer0);
 
-    controller.start().unwrap();
-    println!("is wifi started: {:?}", controller.is_started());
+    let config = Config::Dhcp(Default::default());
 
-    println!("wifi_connect {:?}", controller.connect());
+    let seed = 1234; // very random, very secure seed
 
-    // wait to get connected
-    println!("Wait to get connected");
+    // Init network stack
+    let stack = &*singleton!(Stack::new(
+        wifi_interface,
+        config,
+        singleton!(StackResources::<3>::new()),
+        seed
+    ));
+
+    let executor = EXECUTOR.init(Executor::new());
+    executor.run(|spawner| {
+        spawner.spawn(connection(controller)).ok();
+        spawner.spawn(net_task(&stack)).ok();
+        spawner.spawn(task(&stack)).ok();
+    })
+}
+
+#[embassy_executor::task]
+async fn connection(mut controller: WifiController<'static>) {
+    println!("start connection task");
+    println!("Device capabilities: {:?}", controller.get_capabilities());
     loop {
-        let res = controller.is_connected();
-        match res {
-            Ok(connected) => {
-                if connected {
-                    break;
-                }
+        match esp_wifi::wifi::get_wifi_state() {
+            WifiState::StaConnected => {
+                // wait until we're no longer connected
+                controller.wait_for_event(WifiEvent::StaDisconnected).await;
+                Timer::after(Duration::from_millis(5000)).await
             }
-            Err(err) => {
-                println!("{:?}", err);
-                loop {}
+            _ => {}
+        }
+        if !matches!(controller.is_started(), Ok(true)) {
+            let client_config = Configuration::Client(ClientConfiguration {
+                ssid: SSID.into(),
+                password: PASSWORD.into(),
+                ..Default::default()
+            });
+            controller.set_configuration(&client_config).unwrap();
+            println!("Starting wifi");
+            controller.start().await.unwrap();
+            println!("Wifi started!");
+        }
+        println!("About to connect...");
+
+        match controller.connect().await {
+            Ok(_) => println!("Wifi connected!"),
+            Err(e) => {
+                println!("Failed to connect to wifi: {e:?}");
+                Timer::after(Duration::from_millis(5000)).await
             }
         }
     }
-    println!("{:?}", controller.is_connected());
+}
 
-    let mut local_ip = [0u8; 4];
-    let mut local_ipv6 = [0u16; 8];
+#[embassy_executor::task]
+async fn net_task(stack: &'static Stack<WifiDevice<'static>>) {
+    stack.run().await
+}
 
-    // wait for getting an ip address
-    println!("Wait to get an ip address");
+#[embassy_executor::task]
+async fn task(stack: &'static Stack<WifiDevice<'static>>) {
     loop {
-        wifi_stack.work();
-
-        if wifi_stack.is_iface_up() {
-            println!("got ip {:?}", wifi_stack.get_ip_info());
-            local_ip.copy_from_slice(&wifi_stack.get_ip_info().unwrap().ip.octets());
-            wifi_stack.get_ip_addresses(|addrs| {
-                for addr in addrs {
-                    match addr {
-                        smoltcp::wire::IpCidr::Ipv4(_) => (),
-                        smoltcp::wire::IpCidr::Ipv6(v6) => {
-                            v6.address().write_parts(&mut local_ipv6);
-                            // local_ipv6.copy_from_slice(&[
-                            //     0xfe80, 0, 0, 0, 0x36b4, 0x72ff, 0xfe4c, 0x4410,
-                            // ]);
-                        }
-                    }
-                }
-            });
+        if stack.is_link_up() {
             break;
         }
+        Timer::after(Duration::from_millis(500)).await;
     }
 
-    println!("IPv4 {:?}", &local_ip);
-    println!("IPv6 {:x?}", &local_ipv6);
+    let mut ipv4_addr_octets = [0u8; 4];
+    let mut ipv6_addr_octets = [0u8; 16];
 
-    // these buffers were 1536
-    let mut rx_meta1 = [smoltcp::socket::udp::PacketMetadata::EMPTY; 4];
-    let mut rx_buffer1 = [0u8; 1100];
-    let mut tx_meta1 = [smoltcp::socket::udp::PacketMetadata::EMPTY; 4];
-    let mut tx_buffer1 = [0u8; 900];
-    let mut matter_socket = wifi_stack.get_udp_socket(
-        &mut rx_meta1,
-        &mut rx_buffer1,
-        &mut tx_meta1,
-        &mut tx_buffer1,
-    );
-
-    matter_socket.bind(5540).unwrap();
-
-    let mut rx_meta1 = [smoltcp::socket::udp::PacketMetadata::EMPTY; 4];
-    let mut rx_buffer1 = [0u8; 800];
-    let mut tx_meta1 = [smoltcp::socket::udp::PacketMetadata::EMPTY; 4];
-    let mut tx_buffer1 = [0u8; 800];
-    let mdns_socket = wifi_stack.get_udp_socket(
-        &mut rx_meta1,
-        &mut rx_buffer1,
-        &mut tx_meta1,
-        &mut tx_buffer1,
-    );
-
-    println!("All good - let's go");
-
-    // vid/pid should match those in the DAC
-    let dev_info = BasicInfoConfig {
-        vid: 0xFFF1,
-        pid: 0x8000,
-        hw_ver: 2,
-        sw_ver: 1,
-        sw_ver_str: "1",
-        serial_no: "aabbccdd",
-        device_name: "OnOff Light",
-    };
-
-    let mut mdns = DnsSdResponder::new(mdns_socket, local_ip);
-    let mut dummy_dns = FakeDnsResponder {
-        local_ip: local_ipv6,
-    };
-
-    let matter = Matter::new(
-        &dev_info,
-        &mut dummy_dns,
-        epoch,
-        matter_rand, // my_replay_rand,
-        5540,
-    );
-
-    let dev_att = HardCodedDevAtt::new();
-
-    let mut buf = [0; 1526]; // was 4096
-
-    matter
-        .start(
-            CommissioningData {
-                // TODO: Hard-coded for now
-                verifier: VerifierData::new_with_pw(123456, *matter.borrow()),
-                discriminator: 250,
-            },
-            &mut buf,
-        )
-        .unwrap();
-
-    let matter = &matter;
-    let dev_att = &dev_att;
-
-    let mut transport = TransportMgr::new(matter);
-
-    let mut rx_buf = [0; 800]; // was MAX_RX_BUF_SIZE
-    let mut tx_buf = [0; 900]; // was MAX_TX_BUF_SIZE
-
+    println!("Waiting to get IP address...");
     loop {
-        mdns.poll(current_millis());
+        if let Some(config) = stack.config() {
+            ipv4_addr_octets.copy_from_slice(config.address.address().as_bytes());
+            // TODO hardcoded link local address for now - you will need to change it!
+            ipv6_addr_octets.copy_from_slice(&[
+                0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0x36, 0xb4, 0x72, 0xff, 0xfe, 0x4c, 0x44, 0x10,
+            ]);
+            break;
+        }
+        Timer::after(Duration::from_millis(500)).await;
+    }
 
-        let (len, from, from_port) = if let Ok(res) = matter_socket.receive(&mut rx_buf) {
-            res
-        } else {
-            (0usize, IpAddress::Ipv6(Ipv6Address::UNSPECIFIED), 0)
+    println!("Got IPv4: {:?}", &ipv4_addr_octets);
+    println!("Got IPv6: {:x?}", &ipv6_addr_octets);
+
+    let mut rx_meta = [PacketMetadata::EMPTY; 16];
+    let mut rx_buffer = [0; 4096];
+    let mut tx_meta = [PacketMetadata::EMPTY; 16];
+    let mut tx_buffer = [0; 4096];
+
+    let mut matter_udp_socket = UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut rx_buffer,
+        &mut tx_meta,
+        &mut tx_buffer,
+    );
+    matter_udp_socket.bind(5540).unwrap();
+
+    let mut rx_meta = [PacketMetadata::EMPTY; 16];
+    let mut rx_buffer = [0; 4096];
+    let mut tx_meta = [PacketMetadata::EMPTY; 16];
+    let mut tx_buffer = [0; 4096];
+
+    let mut dnssd_udp_socket = UdpSocket::new(
+        stack,
+        &mut rx_meta,
+        &mut rx_buffer,
+        &mut tx_meta,
+        &mut tx_buffer,
+    );
+    dnssd_udp_socket.bind(5353).unwrap();
+
+    let mut mdns = dnssd::Mdns::new(
+        0,
+        "matter-demo",
+        ipv4_addr_octets,
+        Some(ipv6_addr_octets),
+        Some(dnssd_udp_socket),
+    );
+
+    let (mut mdns, mut mdns_runner) = mdns.split();
+
+    info!("mDNS initialized: {:p}, {:p}", &mdns, &mdns_runner);
+
+    let dev_att = dev_attr::HardCodedDevAtt::new();
+
+    let transport = Transport::new(
+        // vid/pid should match those in the DAC
+        BasicInfoConfig {
+            vid: 0xFFF1,
+            pid: 0x8000,
+            hw_ver: 2,
+            sw_ver: 1,
+            sw_ver_str: "1",
+            serial_no: "aabbccdd",
+            device_name: "OnOff Light",
+        },
+        &dev_att,
+        &mut mdns,
+        epoch,
+        matter_rand,
+        matter::MATTER_PORT,
+    );
+
+    info!("Transport initialized: {:p}", &transport);
+
+    let mut pools = PacketPools::new();
+
+    // //  let psm_path = std::env::temp_dir().join("matter-iot");
+    // //  info!("Persisting from/to {}", psm_path.display());
+
+    // //  let psm = matter::persist::FilePsm::new(psm_path)?;
+
+    // //  load(transport.matter(), &psm)?;
+
+    let node = Node {
+        id: 0,
+        endpoints: &[
+            root_endpoint::endpoint(0),
+            Endpoint {
+                id: 1,
+                device_type: DEV_TYPE_ON_OFF_LIGHT,
+                clusters: &[descriptor::CLUSTER, cluster_on_off::CLUSTER],
+            },
+        ],
+    };
+
+    let handler = handler(transport.matter());
+
+    let node = &node;
+    let handler = &handler;
+    let transport = &transport;
+
+    info!(
+        "About to run wth node {:p}, handler {:p}, transport {:p}, mdns_runner {:p}",
+        node, handler, transport, &mdns_runner
+    );
+
+    let mut mdns = pin!(mdns_runner.run());
+
+    let pools = &mut pools;
+    let matter_udp_socket = &matter_udp_socket;
+
+    let fut = async move {
+        let dev_comm = CommissioningData {
+            // TODO: Hard-coded for now
+            verifier: VerifierData::new_with_pw(123456, *transport.matter().borrow()),
+            discriminator: 250,
         };
 
-        if len == 0 {
-            continue;
-        }
+        let pipe_pools: *mut PacketPools = pools as *mut _;
 
-        let mut from_parts = [0u16; 8];
-        match from {
-            IpAddress::Ipv4(_) => panic!("IPv4 NOT supported"),
-            IpAddress::Ipv6(v6) => v6.write_parts(&mut from_parts),
-        }
+        let tx_buf = unsafe { (*pipe_pools).tx[MAX_EXCHANGES].assume_init_mut() };
+        let rx_buf = unsafe { (*pipe_pools).rx[MAX_EXCHANGES].assume_init_mut() };
 
-        let addr = no_std_net::SocketAddr::V6(no_std_net::SocketAddrV6::new(
-            no_std_net::Ipv6Addr::new(
-                from_parts[0],
-                from_parts[1],
-                from_parts[2],
-                from_parts[3],
-                from_parts[4],
-                from_parts[5],
-                from_parts[6],
-                from_parts[7],
-            ), //from,
-            from_port,
-            0, // flowinfo?
-            0, // scope id?
-        ));
-        let addr = matter::transport::network::Address::Udp(addr);
-        println!("RECEIVED {} bytes from {:?}", len, addr);
-        let mut completion = transport.recv(addr, &mut rx_buf[..len], &mut tx_buf);
+        let tx_pipe = Pipe::new(tx_buf);
+        let rx_pipe = Pipe::new(rx_buf);
 
-        while let Some(action) = completion.next_action().unwrap() {
-            match action {
-                RecvAction::Send(addr, buf) => {
-                    if let Address::Udp(no_std_net::SocketAddr::V6(addr)) = addr {
-                        let port = addr.port();
-                        let addr = addr.ip().octets();
-                        println!("SENDING {} bytes to {:?}:{}", buf.len(), addr, port);
-                        matter_socket
-                            .send(IpAddress::Ipv6(Ipv6Address::from_bytes(&addr)), port, buf)
+        let tx_pipe = &tx_pipe;
+        let rx_pipe = &rx_pipe;
+
+        let mut tx = pin!(async move {
+            loop {
+                {
+                    let mut data = tx_pipe.data.lock().await;
+
+                    if let Some(chunk) = data.chunk {
+                        let remote_endpoint = match chunk.addr.unwrap_udp().ip() {
+                            no_std_net::IpAddr::V4(v4) => IpEndpoint::new(
+                                smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bytes(
+                                    &v4.octets(),
+                                )),
+                                chunk.addr.unwrap_udp().port(),
+                            ),
+                            no_std_net::IpAddr::V6(v6) => IpEndpoint::new(
+                                smoltcp::wire::IpAddress::Ipv6(Ipv6Address::from_bytes(
+                                    &v6.octets(),
+                                )),
+                                chunk.addr.unwrap_udp().port(),
+                            ),
+                        };
+
+                        matter_udp_socket
+                            .send_to(&data.buf[chunk.start..chunk.end], remote_endpoint)
+                            .await
                             .unwrap();
+                        data.chunk = None;
+                        tx_pipe.data_consumed_notification.signal(());
                     }
                 }
-                RecvAction::Interact(mut ctx) => {
-                    let node = Node {
-                        id: 0,
-                        endpoints: &[
-                            root_endpoint::endpoint(0),
-                            Endpoint {
-                                id: 1,
-                                device_type: DEV_TYPE_ON_OFF_LIGHT,
-                                clusters: &[descriptor::CLUSTER, cluster_on_off::CLUSTER],
-                            },
-                        ],
-                    };
 
-                    let mut handler = handler(matter, dev_att);
+                tx_pipe.data_supplied_notification.wait().await;
+            }
+        });
 
-                    let mut im =
-                        InteractionModel(DataModel::new(matter.borrow(), &node, &mut handler));
+        let mut rx = pin!(async move {
+            loop {
+                {
+                    let mut data = rx_pipe.data.lock().await;
 
-                    if im.handle(&mut ctx).unwrap() {
-                        if ctx.send().unwrap() {
-                            let addr = ctx.tx.peer;
-                            if let Address::Udp(no_std_net::SocketAddr::V6(addr)) = addr {
-                                let port = addr.port();
-                                let addr = addr.ip().octets();
-                                println!("SENDING {} bytes to {:?}:{}", buf.len(), addr, port);
-                                matter_socket
-                                    .send(
-                                        IpAddress::Ipv6(Ipv6Address::from_bytes(&addr)),
-                                        port,
-                                        ctx.tx.as_slice(),
-                                    )
-                                    .unwrap();
+                    if data.chunk.is_none() {
+                        let (len, addr) = matter_udp_socket.recv_from(&mut data.buf).await.unwrap();
+                        let port = addr.port;
+
+                        let addr = match addr.addr {
+                            IpAddress::Ipv4(_) => {
+                                let mut addr_bytes = [0u8; 4];
+                                addr_bytes.copy_from_slice(addr.addr.as_bytes());
+                                let ip_addr = Ipv4Addr::from(addr_bytes);
+                                let addr = SocketAddr::V4(SocketAddrV4::new(ip_addr, port));
+                                addr
                             }
-                        }
+                            IpAddress::Ipv6(_) => {
+                                let mut addr_bytes = [0u8; 16];
+                                addr_bytes.copy_from_slice(addr.addr.as_bytes());
+                                let ip_addr = Ipv6Addr::from(addr_bytes);
+                                let addr = SocketAddr::V6(SocketAddrV6::new(ip_addr, port, 0, 0));
+                                addr
+                            }
+                        };
+
+                        data.chunk = Some(Chunk {
+                            start: 0,
+                            end: len,
+                            addr: Address::Udp(addr),
+                        });
+                        rx_pipe.data_supplied_notification.signal(());
                     }
                 }
+
+                rx_pipe.data_consumed_notification.wait().await;
+            }
+        });
+
+        let mut run = pin!(async move {
+            transport
+                .run(pools, &tx_pipe, &rx_pipe, dev_comm, node, handler)
+                .await
+        });
+
+        select4(&mut tx, &mut rx, &mut run, &mut mdns)
+            .await
+            .unwrap()
+    };
+
+    fut.await.unwrap();
+
+    info!("About to exit");
+
+    loop {}
+}
+
+fn handler<'a>(matter: &'a Matter<'a>) -> impl Handler + 'a {
+    root_endpoint::handler(0, matter)
+        .chain(
+            1,
+            descriptor::ID,
+            descriptor::DescriptorCluster::new(*matter.borrow()),
+        )
+        .chain(
+            1,
+            cluster_on_off::ID,
+            OnOffClusterHandlerWrapper {
+                wrapped: cluster_on_off::OnOffCluster::new(*matter.borrow()),
+                value: RefCell::new(false),
+            },
+        )
+}
+
+struct OnOffClusterHandlerWrapper {
+    wrapped: cluster_on_off::OnOffCluster,
+    value: RefCell<bool>,
+}
+
+impl Handler for OnOffClusterHandlerWrapper {
+    fn read(
+        &self,
+        attr: &matter::data_model::objects::AttrDetails,
+        encoder: matter::data_model::objects::AttrDataEncoder,
+    ) -> Result<(), matter::error::Error> {
+        self.wrapped.read(attr, encoder)
+    }
+
+    fn write(
+        &self,
+        attr: &matter::data_model::objects::AttrDetails,
+        data: matter::data_model::objects::AttrData,
+    ) -> Result<(), matter::error::Error> {
+        self.wrapped.write(attr, data)
+    }
+
+    fn invoke(
+        &self,
+        exchange: &matter::transport::exchange::Exchange,
+        cmd: &matter::data_model::objects::CmdDetails,
+        data: &matter::tlv::TLVElement,
+        encoder: matter::data_model::objects::CmdDataEncoder,
+    ) -> Result<(), matter::error::Error> {
+        match cmd.cmd_id.try_into()? {
+            cluster_on_off::Commands::Off => {
+                *self.value.borrow_mut() = false;
+            }
+            cluster_on_off::Commands::On => {
+                *self.value.borrow_mut() = true;
+            }
+            cluster_on_off::Commands::Toggle => {
+                let mut value = self.value.borrow_mut();
+                *value = !*value;
             }
         }
 
-        if let Some(_data) = matter.store_fabrics(&mut buf).unwrap() {
-            // psm.store("fabrics", data)?;
-            println!("TODO store fabrics");
-        }
-
-        if let Some(_data) = matter.store_acls(&mut buf).unwrap() {
-            // psm.store("acls", data)?;
-            println!("TODO store acls");
-        }
+        let state = *self.value.borrow();
+        critical_section::with(|cs| {
+            let mut led = LED.borrow_ref_mut(cs);
+            let led = (*led).borrow_mut().as_mut().unwrap();
+            match state {
+                true => led.set_high().unwrap(),
+                false => led.set_low().unwrap(),
+            }
+        });
+        self.wrapped.invoke(exchange, cmd, data, encoder)
     }
 }
 
@@ -350,18 +506,4 @@ fn matter_rand(buffer: &mut [u8]) {
     for b in buffer.iter_mut() {
         *b = unsafe { esp_wifi::wifi::rand() as u8 };
     }
-}
-
-fn handler<'a>(matter: &'a Matter<'a>, dev_att: &'a dyn DevAttDataFetcher) -> impl Handler + 'a {
-    root_endpoint::handler(0, dev_att, matter)
-        .chain(
-            1,
-            descriptor::ID,
-            descriptor::DescriptorCluster::new(*matter.borrow()),
-        )
-        .chain(
-            1,
-            cluster_on_off::ID,
-            cluster_on_off::OnOffCluster::new(*matter.borrow()),
-        )
 }
