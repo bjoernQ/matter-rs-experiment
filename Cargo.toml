@@ -22,7 +22,7 @@ no-std-net = "0.6"
 heapless = "0.7.16"
 domain = { version = "0.7.2", default_features = false }
 
-matter-iot = { git = "https://github.com/ivmarkov/matter-rs", rev = "fccf9fa5f62329037b17e04fb6afc188d1592c75", default-features = false, features = ["crypto_rustcrypto"] }
+matter-iot = { git = "https://github.com/ivmarkov/matter-rs", rev = "6c6f74e2e0607d3da6b89797fb64f6065b17b166", default-features = false, features = ["crypto_rustcrypto"] }
 
 # would be nice to not need it - however there are allocations made in RustCrypto (apparently even beyond what the X509 handling does)
 esp-alloc = { version = "0.3.0"}

@@ -214,7 +214,7 @@ fn main() -> ! {
         &dev_info,
         &mut dummy_dns,
         epoch,
-        matter_rand, // my_replay_rand,
+        matter_rand,
         5540,
     );
 
@@ -315,7 +315,7 @@ fn main() -> ! {
                             if let Address::Udp(no_std_net::SocketAddr::V6(addr)) = addr {
                                 let port = addr.port();
                                 let addr = addr.ip().octets();
-                                println!("SENDING {} bytes to {:?}:{}", buf.len(), addr, port);
+                                println!("SENDING {} bytes to {:?}:{}", ctx.tx.as_slice().len(), addr, port);
                                 matter_socket
                                     .send(
                                         IpAddress::Ipv6(Ipv6Address::from_bytes(&addr)),
