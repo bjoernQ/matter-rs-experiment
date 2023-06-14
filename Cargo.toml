@@ -24,7 +24,7 @@ domain = { version = "0.7.2", default_features = false }
 
 critical-section = "1.1.1"
 
-#matter-iot = { git = "https://github.com/ivmarkov/matter-rs", rev = "fccf9fa5f62329037b17e04fb6afc188d1592c75", default-features = false, features = ["crypto_rustcrypto"] }
+#matter-iot = { git = "https://github.com/ivmarkov/matter-rs", rev = "31b5a0668e57158e67b5e21cc4ee9d312e47d59c", default-features = false, features = ["crypto_rustcrypto"] }
 matter-iot = { path = "/projects/foo/matter-rs/matter", default-features = false, features = ["crypto_rustcrypto"] }
 # would be nice to not need it - however there are allocations made in RustCrypto (apparently even beyond what the X509 handling does)
 esp-alloc = { version = "0.3.0"}

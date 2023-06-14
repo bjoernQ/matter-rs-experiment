@@ -4,14 +4,19 @@
 #![feature(async_fn_in_trait)]
 
 use core::cell::RefCell;
+use core::mem::MaybeUninit;
 use core::pin::pin;
 
 use embassy_executor::Executor;
 use embassy_executor::_export::StaticCell;
 use hal::gpio::{Gpio5, Output, PushPull};
+use matter::error::Error;
+use matter::mdns::{DefaultMdns, DefaultMdnsRunner};
+use matter::transport::packet::{MAX_RX_BUF_SIZE, MAX_TX_BUF_SIZE};
+use matter::transport::runner::{RxBuf, TransportRunner, TxBuf};
 
 use core::borrow::{Borrow, BorrowMut};
-use embassy_futures::select::select4;
+use embassy_futures::select::{self, select3, select4};
 use embassy_net::udp::UdpSocket;
 use embassy_net::{udp::PacketMetadata, Config, Ipv4Address, Stack, StackResources};
 use embassy_time::{Duration, Timer};
@@ -28,22 +33,20 @@ use hal::{peripherals::Peripherals, prelude::*, timer::TimerGroup, Rtc};
 use log::info;
 use matter::data_model::cluster_basic_information::BasicInfoConfig;
 use matter::data_model::device_types::DEV_TYPE_ON_OFF_LIGHT;
-use matter::data_model::objects::{Endpoint, Handler, Node};
+use matter::data_model::objects::{DataModelHandler, Endpoint, Handler, HandlerCompat, Node};
 use matter::data_model::system_model::descriptor;
 use matter::data_model::{cluster_on_off, root_endpoint};
 use matter::secure_channel::spake2p::VerifierData;
+use matter::transport::core::Transport;
 use matter::transport::exchange::MAX_EXCHANGES;
 use matter::transport::network::Address;
 use matter::transport::pipe::{Chunk, Pipe};
-use matter::transport::transport::{PacketPools, Transport};
 use matter::utils::select::EitherUnwrap;
 use matter::{CommissioningData, Matter};
 use no_std_net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv6Address};
 
 mod dev_attr;
-
-mod dnssd;
 
 extern crate alloc;
 
@@ -246,41 +249,51 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
     );
     dnssd_udp_socket.bind(5353).unwrap();
 
-    let mut mdns = dnssd::Mdns::new(
+    let dev_det = BasicInfoConfig {
+        vid: 0xFFF1,
+        pid: 0x8000,
+        hw_ver: 2,
+        sw_ver: 1,
+        sw_ver_str: "1",
+        serial_no: "aabbccdd",
+        device_name: "OnOff Light",
+    };
+
+    let mdns = DefaultMdns::new(
         0,
         "matter-demo",
         ipv4_addr_octets,
         Some(ipv6_addr_octets),
-        Some(dnssd_udp_socket),
+        0,
+        &dev_det,
+        matter::MATTER_PORT,
     );
 
-    let (mut mdns, mut mdns_runner) = mdns.split();
+    let mut mdns_runner = DefaultMdnsRunner::new(&mdns);
 
     info!("mDNS initialized: {:p}, {:p}", &mdns, &mdns_runner);
 
     let dev_att = dev_attr::HardCodedDevAtt::new();
 
-    let transport = Transport::new(
+    let matter = Matter::new(
         // vid/pid should match those in the DAC
-        BasicInfoConfig {
-            vid: 0xFFF1,
-            pid: 0x8000,
-            hw_ver: 2,
-            sw_ver: 1,
-            sw_ver_str: "1",
-            serial_no: "aabbccdd",
-            device_name: "OnOff Light",
-        },
+        &dev_det,
         &dev_att,
-        &mut mdns,
+        &mdns,
         epoch,
         matter_rand,
         matter::MATTER_PORT,
     );
 
-    info!("Transport initialized: {:p}", &transport);
+    let mut runner = TransportRunner::new(&matter);
 
-    let mut pools = PacketPools::new();
+    let mut buf = [0; 4096];
+    let buf = &mut buf;
+
+    info!("Transport runner initialized: {:p}", &runner);
+
+    let mut tx_buf = TxBuf::uninit();
+    let mut rx_buf = RxBuf::uninit();
 
     // //  let psm_path = std::env::temp_dir().join("matter-iot");
     // //  info!("Persisting from/to {}", psm_path.display());
@@ -301,36 +314,37 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
         ],
     };
 
-    let handler = handler(transport.matter());
+    let handler = HandlerCompat(handler(&matter));
 
+    let matter = &matter;
     let node = &node;
     let handler = &handler;
-    let transport = &transport;
+    let runner = &mut runner;
+    let tx_buf = &mut tx_buf;
+    let rx_buf = &mut rx_buf;
+
+    let dev_comm = CommissioningData {
+        // TODO: Hard-coded for now
+        verifier: VerifierData::new_with_pw(123456, *matter.borrow()),
+        discriminator: 250,
+    };
 
     info!(
-        "About to run wth node {:p}, handler {:p}, transport {:p}, mdns_runner {:p}",
-        node, handler, transport, &mdns_runner
+        "About to run wth node {:p}, handler {:p}, transport runner {:p}, mdns_runner {:p}",
+        node, handler, runner, &mdns_runner
     );
 
-    let mut mdns = pin!(mdns_runner.run());
-
-    let pools = &mut pools;
     let matter_udp_socket = &matter_udp_socket;
 
-    let fut = async move {
-        let dev_comm = CommissioningData {
-            // TODO: Hard-coded for now
-            verifier: VerifierData::new_with_pw(123456, *transport.matter().borrow()),
-            discriminator: 250,
-        };
+    let mut tx_buf = TxBuf::uninit();
+    let mut rx_buf = RxBuf::uninit();
 
-        let pipe_pools: *mut PacketPools = pools as *mut _;
+    let tx_buf = &mut tx_buf;
+    let rx_buf = &mut rx_buf;
 
-        let tx_buf = unsafe { (*pipe_pools).tx[MAX_EXCHANGES].assume_init_mut() };
-        let rx_buf = unsafe { (*pipe_pools).rx[MAX_EXCHANGES].assume_init_mut() };
-
-        let tx_pipe = Pipe::new(tx_buf);
-        let rx_pipe = Pipe::new(rx_buf);
+    let mut transport_run = pin!(async move {
+        let tx_pipe = Pipe::new(unsafe { tx_buf.assume_init_mut() });
+        let rx_pipe = Pipe::new(unsafe { rx_buf.assume_init_mut() });
 
         let tx_pipe = &tx_pipe;
         let rx_pipe = &rx_pipe;
@@ -360,6 +374,7 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
                             .send_to(&data.buf[chunk.start..chunk.end], remote_endpoint)
                             .await
                             .unwrap();
+
                         data.chunk = None;
                         tx_pipe.data_consumed_notification.signal(());
                     }
@@ -408,16 +423,117 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
             }
         });
 
-        let mut run = pin!(async move {
-            transport
-                .run(pools, &tx_pipe, &rx_pipe, dev_comm, node, handler)
-                .await
+        let mut run =
+            pin!(async move { runner.run(tx_pipe, rx_pipe, dev_comm, node, handler).await });
+
+        select3(&mut tx, &mut rx, &mut run).await.unwrap()
+    });
+
+    let mut mdns_run = pin!(async move {
+        type MdnsTxBuf = MaybeUninit<[u8; MAX_TX_BUF_SIZE]>;
+        type MdnsRxBuf = MaybeUninit<[u8; MAX_RX_BUF_SIZE]>;
+
+        let mut tx_buf = MdnsTxBuf::uninit();
+        let mut rx_buf = MdnsRxBuf::uninit();
+
+        let tx_buf = &mut tx_buf;
+        let rx_buf = &mut rx_buf;
+
+        let tx_pipe = Pipe::new(unsafe { tx_buf.assume_init_mut() });
+        let rx_pipe = Pipe::new(unsafe { rx_buf.assume_init_mut() });
+
+        let tx_pipe = &tx_pipe;
+        let rx_pipe = &rx_pipe;
+
+        let udp = &dnssd_udp_socket;
+
+        let mut tx = pin!(async move {
+            loop {
+                {
+                    let mut data = tx_pipe.data.lock().await;
+
+                    if let Some(chunk) = data.chunk {
+                        let remote_endpoint = match chunk.addr.unwrap_udp().ip() {
+                            no_std_net::IpAddr::V4(v4) => IpEndpoint::new(
+                                smoltcp::wire::IpAddress::Ipv4(Ipv4Address::from_bytes(
+                                    &v4.octets(),
+                                )),
+                                chunk.addr.unwrap_udp().port(),
+                            ),
+                            no_std_net::IpAddr::V6(v6) => IpEndpoint::new(
+                                smoltcp::wire::IpAddress::Ipv6(Ipv6Address::from_bytes(
+                                    &v6.octets(),
+                                )),
+                                chunk.addr.unwrap_udp().port(),
+                            ),
+                        };
+
+                        udp.send_to(&data.buf[chunk.start..chunk.end], remote_endpoint)
+                            .await
+                            .unwrap();
+
+                        data.chunk = None;
+                        tx_pipe.data_consumed_notification.signal(());
+                    }
+                }
+
+                tx_pipe.data_supplied_notification.wait().await;
+            }
         });
 
-        select4(&mut tx, &mut rx, &mut run, &mut mdns)
-            .await
-            .unwrap()
-    };
+        let mut rx = pin!(async move {
+            loop {
+                {
+                    let mut data = rx_pipe.data.lock().await;
+
+                    if data.chunk.is_none() {
+                        let (len, addr) = matter_udp_socket.recv_from(&mut data.buf).await.unwrap();
+                        let port = addr.port;
+
+                        let addr = match addr.addr {
+                            IpAddress::Ipv4(_) => {
+                                let mut addr_bytes = [0u8; 4];
+                                addr_bytes.copy_from_slice(addr.addr.as_bytes());
+                                let ip_addr = Ipv4Addr::from(addr_bytes);
+                                let addr = SocketAddr::V4(SocketAddrV4::new(ip_addr, port));
+                                addr
+                            }
+                            IpAddress::Ipv6(_) => {
+                                let mut addr_bytes = [0u8; 16];
+                                addr_bytes.copy_from_slice(addr.addr.as_bytes());
+                                let ip_addr = Ipv6Addr::from(addr_bytes);
+                                let addr = SocketAddr::V6(SocketAddrV6::new(ip_addr, port, 0, 0));
+                                addr
+                            }
+                        };
+
+                        data.chunk = Some(Chunk {
+                            start: 0,
+                            end: len,
+                            addr: Address::Udp(addr),
+                        });
+                        rx_pipe.data_supplied_notification.signal(());
+                    }
+                }
+
+                rx_pipe.data_consumed_notification.wait().await;
+            }
+        });
+
+        let mut run = pin!(async move { mdns_runner.run(tx_pipe, rx_pipe).await });
+
+        select3(&mut tx, &mut rx, &mut run).await.unwrap()
+    });
+
+    let mut fut = pin!(async move {
+        select::select(
+            &mut transport_run,
+            &mut mdns_run,
+            //save(transport, &psm),
+        )
+        .await
+        .unwrap()
+    });
 
     fut.await.unwrap();
 
