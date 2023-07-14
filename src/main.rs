@@ -3,20 +3,18 @@
 #![feature(type_alias_impl_trait)]
 #![feature(async_fn_in_trait)]
 
-use core::cell::RefCell;
 use core::mem::MaybeUninit;
 use core::pin::pin;
 
 use embassy_executor::Executor;
 use embassy_executor::_export::StaticCell;
-use hal::gpio::{Gpio5, Output, PushPull};
-use matter::error::Error;
+use embassy_net::{ConfigV4, ConfigV6, Ipv6Cidr, StaticConfigV6};
 use matter::mdns::{DefaultMdns, DefaultMdnsRunner};
 use matter::transport::packet::{MAX_RX_BUF_SIZE, MAX_TX_BUF_SIZE};
 use matter::transport::runner::{RxBuf, TransportRunner, TxBuf};
 
-use core::borrow::{Borrow, BorrowMut};
-use embassy_futures::select::{self, select3, select4};
+use core::borrow::Borrow;
+use embassy_futures::select::{self, select3};
 use embassy_net::udp::UdpSocket;
 use embassy_net::{udp::PacketMetadata, Config, Ipv4Address, Stack, StackResources};
 use embassy_time::{Duration, Timer};
@@ -25,20 +23,18 @@ use embedded_svc::wifi::{ClientConfiguration, Configuration};
 use esp_backtrace as _;
 use esp_println::println;
 use esp_wifi::wifi::{WifiController, WifiDevice, WifiEvent, WifiMode, WifiState};
-use esp_wifi::{current_millis, initialize};
+use esp_wifi::{current_millis, initialize, EspWifiInitFor};
 use hal::clock::{ClockControl, CpuClock};
 use hal::systimer::SystemTimer;
-use hal::{embassy, Rng, IO};
+use hal::{embassy, Rng};
 use hal::{peripherals::Peripherals, prelude::*, timer::TimerGroup, Rtc};
 use log::info;
 use matter::data_model::cluster_basic_information::BasicInfoConfig;
 use matter::data_model::device_types::DEV_TYPE_ON_OFF_LIGHT;
-use matter::data_model::objects::{DataModelHandler, Endpoint, Handler, HandlerCompat, Node};
+use matter::data_model::objects::{Endpoint, HandlerCompat, Metadata, Node, NonBlockingHandler};
 use matter::data_model::system_model::descriptor;
 use matter::data_model::{cluster_on_off, root_endpoint};
 use matter::secure_channel::spake2p::VerifierData;
-use matter::transport::core::Transport;
-use matter::transport::exchange::MAX_EXCHANGES;
 use matter::transport::network::Address;
 use matter::transport::pipe::{Chunk, Pipe};
 use matter::utils::select::EitherUnwrap;
@@ -56,9 +52,6 @@ static ALLOCATOR: esp_alloc::EspHeap = esp_alloc::EspHeap::empty();
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 
-static LED: critical_section::Mutex<RefCell<Option<Gpio5<Output<PushPull>>>>> =
-    critical_section::Mutex::new(RefCell::new(None));
-
 macro_rules! singleton {
     ($val:expr) => {{
         type T = impl Sized;
@@ -71,7 +64,8 @@ macro_rules! singleton {
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 fn init_heap() {
-    const HEAP_SIZE: usize = 2 * 1024;
+    // we need some heap memory unfortunately
+    const HEAP_SIZE: usize = 8 * 1024;
 
     extern "C" {
         static mut _heap_start: u32;
@@ -111,14 +105,9 @@ fn main() -> ! {
     wdt0.disable();
     wdt1.disable();
 
-    let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let led = io.pins.gpio5.into_push_pull_output();
-    critical_section::with(|cs| {
-        LED.borrow_ref_mut(cs).replace(led);
-    });
-
     let systimer = SystemTimer::new(peripherals.SYSTIMER);
-    initialize(
+    let inited = initialize(
+        EspWifiInitFor::Wifi,
         systimer.alarm0,
         Rng::new(peripherals.RNG),
         system.radio_clock_control,
@@ -128,11 +117,22 @@ fn main() -> ! {
 
     // Connect to wifi
     let (wifi, _) = peripherals.RADIO.split();
-    let (wifi_interface, controller) = esp_wifi::wifi::new_with_mode(wifi, WifiMode::Sta);
+    let (wifi_interface, controller) = esp_wifi::wifi::new_with_mode(&inited, wifi, WifiMode::Sta);
 
     embassy::init(&clocks, timer_group0.timer0);
 
-    let config = Config::Dhcp(Default::default());
+    let config = Config {
+        ipv4: ConfigV4::Dhcp(Default::default()),
+        ipv6: ConfigV6::Static(StaticConfigV6 {
+            address: Ipv6Cidr::new(
+                // TODO: hard-coded link local address
+                Ipv6Address::new(0xfe80, 0, 0, 0, 0x36b4, 0x72ff, 0xfe4c, 0x4410),
+                64,
+            ),
+            gateway: Some(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)),
+            dns_servers: heapless::Vec::new(),
+        }),
+    };
 
     let seed = 1234; // very random, very secure seed
 
@@ -207,7 +207,7 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
 
     println!("Waiting to get IP address...");
     loop {
-        if let Some(config) = stack.config() {
+        if let Some(config) = stack.config_v4() {
             ipv4_addr_octets.copy_from_slice(config.address.address().as_bytes());
             // TODO hardcoded link local address for now - you will need to change it!
             ipv6_addr_octets.copy_from_slice(&[
@@ -287,20 +287,7 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
 
     let mut runner = TransportRunner::new(&matter);
 
-    let mut buf = [0; 4096];
-    let buf = &mut buf;
-
     info!("Transport runner initialized: {:p}", &runner);
-
-    let mut tx_buf = TxBuf::uninit();
-    let mut rx_buf = RxBuf::uninit();
-
-    // //  let psm_path = std::env::temp_dir().join("matter-iot");
-    // //  info!("Persisting from/to {}", psm_path.display());
-
-    // //  let psm = matter::persist::FilePsm::new(psm_path)?;
-
-    // //  load(transport.matter(), &psm)?;
 
     let node = Node {
         id: 0,
@@ -320,8 +307,6 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
     let node = &node;
     let handler = &handler;
     let runner = &mut runner;
-    let tx_buf = &mut tx_buf;
-    let rx_buf = &mut rx_buf;
 
     let dev_comm = CommissioningData {
         // TODO: Hard-coded for now
@@ -331,7 +316,7 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
 
     info!(
         "About to run wth node {:p}, handler {:p}, transport runner {:p}, mdns_runner {:p}",
-        node, handler, runner, &mdns_runner
+        node, &handler, runner, &mdns_runner
     );
 
     let matter_udp_socket = &matter_udp_socket;
@@ -423,8 +408,7 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
             }
         });
 
-        let mut run =
-            pin!(async move { runner.run(tx_pipe, rx_pipe, dev_comm, node, handler).await });
+        let mut run = pin!(async move { runner.run(tx_pipe, rx_pipe, dev_comm, handler).await });
 
         select3(&mut tx, &mut rx, &mut run).await.unwrap()
     });
@@ -467,7 +451,6 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
                                 chunk.addr.unwrap_udp().port(),
                             ),
                         };
-
                         udp.send_to(&data.buf[chunk.start..chunk.end], remote_endpoint)
                             .await
                             .unwrap();
@@ -487,7 +470,7 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
                     let mut data = rx_pipe.data.lock().await;
 
                     if data.chunk.is_none() {
-                        let (len, addr) = matter_udp_socket.recv_from(&mut data.buf).await.unwrap();
+                        let (len, addr) = udp.recv_from(&mut data.buf).await.unwrap();
                         let port = addr.port;
 
                         let addr = match addr.addr {
@@ -506,7 +489,6 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
                                 addr
                             }
                         };
-
                         data.chunk = Some(Chunk {
                             start: 0,
                             end: len,
@@ -525,14 +507,10 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
         select3(&mut tx, &mut rx, &mut run).await.unwrap()
     });
 
-    let mut fut = pin!(async move {
-        select::select(
-            &mut transport_run,
-            &mut mdns_run,
-            //save(transport, &psm),
-        )
-        .await
-        .unwrap()
+    let fut = pin!(async move {
+        select::select(&mut transport_run, &mut mdns_run)
+            .await
+            .unwrap()
     });
 
     fut.await.unwrap();
@@ -542,76 +520,33 @@ async fn task(stack: &'static Stack<WifiDevice<'static>>) {
     loop {}
 }
 
-fn handler<'a>(matter: &'a Matter<'a>) -> impl Handler + 'a {
-    root_endpoint::handler(0, matter)
-        .chain(
-            1,
-            descriptor::ID,
-            descriptor::DescriptorCluster::new(*matter.borrow()),
-        )
-        .chain(
-            1,
-            cluster_on_off::ID,
-            OnOffClusterHandlerWrapper {
-                wrapped: cluster_on_off::OnOffCluster::new(*matter.borrow()),
-                value: RefCell::new(false),
-            },
-        )
-}
+const NODE: Node<'static> = Node {
+    id: 0,
+    endpoints: &[
+        root_endpoint::endpoint(0),
+        Endpoint {
+            id: 1,
+            device_type: DEV_TYPE_ON_OFF_LIGHT,
+            clusters: &[descriptor::CLUSTER, cluster_on_off::CLUSTER],
+        },
+    ],
+};
 
-struct OnOffClusterHandlerWrapper {
-    wrapped: cluster_on_off::OnOffCluster,
-    value: RefCell<bool>,
-}
-
-impl Handler for OnOffClusterHandlerWrapper {
-    fn read(
-        &self,
-        attr: &matter::data_model::objects::AttrDetails,
-        encoder: matter::data_model::objects::AttrDataEncoder,
-    ) -> Result<(), matter::error::Error> {
-        self.wrapped.read(attr, encoder)
-    }
-
-    fn write(
-        &self,
-        attr: &matter::data_model::objects::AttrDetails,
-        data: matter::data_model::objects::AttrData,
-    ) -> Result<(), matter::error::Error> {
-        self.wrapped.write(attr, data)
-    }
-
-    fn invoke(
-        &self,
-        exchange: &matter::transport::exchange::Exchange,
-        cmd: &matter::data_model::objects::CmdDetails,
-        data: &matter::tlv::TLVElement,
-        encoder: matter::data_model::objects::CmdDataEncoder,
-    ) -> Result<(), matter::error::Error> {
-        match cmd.cmd_id.try_into()? {
-            cluster_on_off::Commands::Off => {
-                *self.value.borrow_mut() = false;
-            }
-            cluster_on_off::Commands::On => {
-                *self.value.borrow_mut() = true;
-            }
-            cluster_on_off::Commands::Toggle => {
-                let mut value = self.value.borrow_mut();
-                *value = !*value;
-            }
-        }
-
-        let state = *self.value.borrow();
-        critical_section::with(|cs| {
-            let mut led = LED.borrow_ref_mut(cs);
-            let led = (*led).borrow_mut().as_mut().unwrap();
-            match state {
-                true => led.set_high().unwrap(),
-                false => led.set_low().unwrap(),
-            }
-        });
-        self.wrapped.invoke(exchange, cmd, data, encoder)
-    }
+fn handler<'a>(matter: &'a Matter<'a>) -> impl Metadata + NonBlockingHandler + 'a {
+    (
+        NODE,
+        root_endpoint::handler(0, matter)
+            .chain(
+                1,
+                descriptor::ID,
+                descriptor::DescriptorCluster::new(*matter.borrow()),
+            )
+            .chain(
+                1,
+                cluster_on_off::ID,
+                cluster_on_off::OnOffCluster::new(*matter.borrow()),
+            ),
+    )
 }
 
 fn epoch() -> core::time::Duration {
