@@ -23,7 +23,7 @@ heapless = "0.7.16"
 
 critical-section = "1.1.1"
 
-matter-iot = { git = "https://github.com/ivmarkov/matter-rs", branch = "sequential-embassy-net", default-features = false, features = ["crypto_rustcrypto", "embassy-net"] }
+rs-matter = { git = "https://github.com/ivmarkov/matter-rs", default-features = false, features = ["rustcrypto", "embassy-net"] }
 # would be nice to not need it - however there are allocations made in RustCrypto (apparently even beyond what the X509 handling does)
 esp-alloc = { version = "0.3.0"}
 

@@ -6,9 +6,9 @@
 use embassy_executor::Executor;
 use embassy_executor::_export::StaticCell;
 use embassy_net::{ConfigV4, ConfigV6, Ipv6Cidr, StaticConfigV6};
-use matter::error::Error;
-use matter::mdns::MdnsService;
-use matter::transport::runner::{AllUdpBuffers, TransportRunner};
+use rs_matter::error::Error;
+use rs_matter::mdns::{MdnsService, MdnsRunBuffers};
+use rs_matter::transport::core::RunBuffers;
 use static_cell::make_static;
 
 use core::borrow::Borrow;
@@ -25,13 +25,14 @@ use hal::systimer::SystemTimer;
 use hal::{embassy, Rng};
 use hal::{peripherals::Peripherals, prelude::*, timer::TimerGroup, Rtc};
 use log::info;
-use matter::data_model::cluster_basic_information::BasicInfoConfig;
-use matter::data_model::device_types::DEV_TYPE_ON_OFF_LIGHT;
-use matter::data_model::objects::{Endpoint, HandlerCompat, Metadata, Node, NonBlockingHandler};
-use matter::data_model::system_model::descriptor;
-use matter::data_model::{cluster_on_off, root_endpoint};
-use matter::secure_channel::spake2p::VerifierData;
-use matter::{CommissioningData, Matter};
+
+use rs_matter::data_model::cluster_basic_information::BasicInfoConfig;
+use rs_matter::data_model::device_types::DEV_TYPE_ON_OFF_LIGHT;
+use rs_matter::data_model::objects::{Endpoint, HandlerCompat, Metadata, Node, NonBlockingHandler};
+use rs_matter::data_model::system_model::descriptor;
+use rs_matter::data_model::{cluster_on_off, root_endpoint};
+use rs_matter::secure_channel::spake2p::VerifierData;
+use rs_matter::{CommissioningData, Matter};
 use no_std_net::{Ipv4Addr, Ipv6Addr};
 use smoltcp::wire::Ipv6Address;
 
@@ -229,11 +230,11 @@ async fn run_matter(
     ipv6_addr: Option<Ipv6Addr>,
 ) -> Result<(), Error> {
     info!(
-        "Matter required memory: mDNS={}, Matter={}, TransportRunner={}, UdpBuffers={}",
+        "Matter required memory: mDNS={}, Matter={}, MdnsBuffers={}, RunBuffers={}",
         core::mem::size_of::<MdnsService>(),
         core::mem::size_of::<Matter>(),
-        core::mem::size_of::<TransportRunner>(),
-        core::mem::size_of::<AllUdpBuffers>(),
+        core::mem::size_of::<MdnsRunBuffers>(),
+        core::mem::size_of::<RunBuffers>(),
     );
 
     let dev_det = &*make_static!(BasicInfoConfig {
@@ -254,7 +255,7 @@ async fn run_matter(
         ipv4_addr.octets(),
         ipv6_addr.map(|ip| (ip.octets(), 0)),
         dev_det,
-        matter::MATTER_PORT,
+        rs_matter::MATTER_PORT,
     ));
 
     let matter = &*make_static!(Matter::new(
@@ -264,19 +265,16 @@ async fn run_matter(
         mdns,
         epoch,
         matter_rand,
-        matter::MATTER_PORT,
+        rs_matter::MATTER_PORT,
     ));
-
-    let runner = make_static!(TransportRunner::new(matter));
 
     let handler = &*make_static!(HandlerCompat(handler(matter)));
 
-    let buffers = make_static!(AllUdpBuffers::new());
+    let mut buffers = make_static!(RunBuffers::new());
 
-    let fut = runner.run_udp_all(
+    let fut = matter.run(
         stack,
-        mdns,
-        buffers,
+        &mut buffers,
         CommissioningData {
             // TODO: Hard-coded for now
             verifier: VerifierData::new_with_pw(123456, *matter.borrow()),
